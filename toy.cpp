@@ -1,9 +1,23 @@
 #include <cctype>
 #include <cstdio>
+#include <llvm-10/llvm/IR/DerivedTypes.h>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Verifier.h>
+
+using namespace llvm;
+static std::unique_ptr<LLVMContext> TheContext;
+static std::unique_ptr<IRBuilder<>> Builder;
+static std::unique_ptr<Module> TheModule;
+static std::map<std::string, Value *> NamedValues;
+
+Value *LogErrorV(const char *Str);
+
 enum Token {
   tok_eof = -1,
 
@@ -77,6 +91,7 @@ static int gettok() {
 class ExprAST {
 public:
   virtual ~ExprAST() = default;
+  virtual Value *codegen() = 0;
 };
 
 // NumberExpAST - Expression class for numeric literals like "1.0".
@@ -85,7 +100,12 @@ class NumberExprAST : public ExprAST {
 
 public:
   NumberExprAST(double Val) : Val(Val) {}
+  Value *codegen() override;
 };
+
+Value *NumberExprAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(Val));
+}
 
 // VariableExprAST - Expression class for referecing a variable. like "a".
 class VariableExprAST : public ExprAST {
@@ -93,7 +113,15 @@ class VariableExprAST : public ExprAST {
 
 public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
+  Value *codegen() override;
 };
+
+Value *VariableExprAST::codegen() {
+  Value *V = NamedValues[Name];
+  if (!V)
+    LogErrorV("Unknown variable name");
+  return V;
+}
 
 // BinaryExprAST - Expression class for a binary operator.
 class BinaryExprAST : public ExprAST {
@@ -104,7 +132,29 @@ public:
   BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
                 std::unique_ptr<ExprAST> RHS)
       : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+  Value *codegen() override;
 };
+
+Value *BinaryExprAST::codegen() {
+  Value *L = LHS->codegen();
+  Value *R = RHS->codegen();
+
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case '+':
+    return Builder->CreateFAdd(L, R, "addtmp");
+  case '-':
+    return Builder->CreateFSub(L, R, "subtmp");
+  case '*':
+    return Builder->CreateFMul(L, R, "multmp");
+  case '<':
+    return Builder->CreateFCmpULT(L, R, "cmptmp");
+  default:
+    return LogErrorV("invalid binay operator");
+  }
+}
 
 // CallExprAST - Expression class for function calls.
 class CallExprAST : public ExprAST {
@@ -115,20 +165,61 @@ public:
   CallExprAST(const std::string &Callee,
               std::vector<std::unique_ptr<ExprAST>> Args)
       : Callee(Callee), Args(std::move(Args)) {}
+  Value *codegen() override;
 };
+
+Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = TheModule->getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV("Unknown function referenced");
+
+  // If argument mismatch error.
+  if (CalleeF->arg_size() != Args.size())
+    return LogErrorV("Incorrect $ arguments passed");
+
+  std::vector<Value *> ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]->codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
+}
 
 // PrototypeAST - This class represents the "prototype" for a function,
 // which captures its name, and its argument names (thus implicitly the number
 // of arguments the function takes).
 class PrototypeAST {
   std::string Name;
-  std::vector<std::string> Args;
 
 public:
+  std::vector<std::string> Args;
   PrototypeAST(const std::string &Name, std::vector<std::string> Args)
       : Name(Name), Args(std::move(Args)) {}
   const std::string &getName() const { return Name; }
+  Function *codegen();
 };
+
+Function *PrototypeAST::codegen() {
+  // Make the function type: double(double,double) etc.
+  std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+
+  FunctionType *FT =
+      FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+  // Set names for all arguments.
+  // unsigned Idx = 0;
+  // for (auto &Arg : F->args()) {
+  //   Arg.setName(Args[Idx++]);
+  // }
+
+  return F;
+}
 
 // FunctionAST - This class represents a function definititon itself.
 class FunctionAST {
@@ -139,7 +230,52 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+  Function *codegen();
 };
+
+Function *FunctionAST::codegen() {
+  // First, check for an existing funtion from a previoous 'extern'
+  // declaration.
+  Function *TheFunction = TheModule->getFunction(Proto->getName());
+
+  if (!TheFunction)
+    TheFunction = Proto->codegen();
+
+  if (!TheFunction)
+    return nullptr;
+
+  if (!TheFunction->empty())
+    return (Function *)LogErrorV("Function cannot be redefined.");
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
+  Builder->SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  
+  // Set names for all arguments.
+  unsigned Idx = 0;
+  for (auto &Arg : TheFunction->args()) {
+    Arg.setName(Proto->Args[Idx++]);
+    NamedValues[std::string(Arg.getName())] = &Arg;
+  }
+
+  if (Value *RetVal = Body->codegen()) {
+    // Finish off the function
+    Builder->CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    verifyFunction(*TheFunction);
+
+    return TheFunction;
+  }
+
+  // Error reading body,remove function from symbol table
+  TheFunction->eraseFromParent();
+  return nullptr;
+}
 
 // CurTok /getNextToken - Provide a simple token buffer. CurTok is the current
 // token the parser is looking at. getNextToken reads another token from the
@@ -154,6 +290,11 @@ std::unique_ptr<ExprAST> LogError(const char *Str) {
   return nullptr;
 }
 std::unique_ptr<PrototypeAST> LogErrorP(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+Value *LogErrorV(const char *Str) {
   LogError(Str);
   return nullptr;
 }
@@ -342,7 +483,8 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   if (auto E = ParseExpression()) {
     // Make an anonymous proto.
-    auto Proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
+    auto Proto = std::make_unique<PrototypeAST>("__anon_expr",
+                                                std::vector<std::string>());
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   }
   return nullptr;
@@ -350,23 +492,34 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 //===========-----------------------------------------------------------------------------------------=======//
 // Top-level parsing
 static void HandleDefinition() {
-  if (ParseDefinition()) {
-    fprintf(stderr, "Parsed a function definition.\n");
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST->codegen()) {
+      fprintf(stderr, "Read function definition:");
+      FnIR->print(errs());
+    }
   } else {
     getNextToken();
   }
 }
 static void HandleExtern() {
-  if (ParseExtern()) {
-    fprintf(stderr, "Parsed a extern decls.\n");
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *IR = ProtoAST->codegen()) {
+      fprintf(stderr, "Read ProtoType:");
+      IR->print(errs());
+    }
   } else {
     getNextToken();
   }
 }
 
 static void HandleTopLevelExpression() {
-  if (ParseTopLevelExpr()) {
-    fprintf(stderr, "Parsed a top-level definition.\n");
+  // Evaluate a top-level expression into an anonymous function.
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (auto *FnIR = FnAST->codegen()) {
+      fprintf(stderr, "Read top-lev expression:");
+      FnIR->print(errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     getNextToken();
   }
@@ -393,7 +546,19 @@ static void MainLoop() {
     }
   }
 }
+
+// Top-level parsing and JIT Driver
+static void InitializeModule() {
+  // Open a new context and moudle.
+  TheContext = std::make_unique<LLVMContext>();
+  TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+
+  // Create a new builder for the module.
+  Builder = std::make_unique<IRBuilder<>>(*TheContext);
+}
 int main() {
+  InitializeModule();
+
   // Install standard binary operators.
   // 1 is lowest precedence.
   BinopPrecedence['<'] = 10;
