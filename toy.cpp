@@ -1,20 +1,28 @@
 #include <cctype>
 #include <cstdio>
-#include <llvm-10/llvm/IR/DerivedTypes.h>
+#include <llvm-10/llvm/Transforms/Scalar.h>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Scalar/GVN.h>
 
 using namespace llvm;
+
 static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::unique_ptr<Module> TheModule;
 static std::map<std::string, Value *> NamedValues;
+static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
 
 Value *LogErrorV(const char *Str);
 
@@ -221,6 +229,8 @@ Function *PrototypeAST::codegen() {
   return F;
 }
 
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+
 // FunctionAST - This class represents a function definititon itself.
 class FunctionAST {
   std::unique_ptr<PrototypeAST> Proto;
@@ -254,7 +264,7 @@ Function *FunctionAST::codegen() {
 
   // Record the function arguments in the NamedValues map.
   NamedValues.clear();
-  
+
   // Set names for all arguments.
   unsigned Idx = 0;
   for (auto &Arg : TheFunction->args()) {
@@ -268,6 +278,9 @@ Function *FunctionAST::codegen() {
 
     // Validate the generated code, checking for consistency.
     verifyFunction(*TheFunction);
+
+    // Optimize the function.
+    TheFPM->run(*TheFunction);
 
     return TheFunction;
   }
@@ -548,16 +561,30 @@ static void MainLoop() {
 }
 
 // Top-level parsing and JIT Driver
-static void InitializeModule() {
+static void InitializeModuleAndPassManager() {
   // Open a new context and moudle.
   TheContext = std::make_unique<LLVMContext>();
   TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+
+  // Create a new pass manager attached to it.
+  TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
+
+  // Do simple "peephole" optimizations and bit-twiddling optzns.
+  TheFPM->add(createInstructionCombiningPass());
+  // Reassociate expressions.
+  TheFPM->add(createReassociatePass());
+  // Eliminate Common SubExpression.
+  TheFPM->add(createGVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM->add(createCFGSimplificationPass());
+
+  TheFPM->doInitialization();
 
   // Create a new builder for the module.
   Builder = std::make_unique<IRBuilder<>>(*TheContext);
 }
 int main() {
-  InitializeModule();
+  InitializeModuleAndPassManager();
 
   // Install standard binary operators.
   // 1 is lowest precedence.
