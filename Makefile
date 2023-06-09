@@ -6,7 +6,7 @@ ldflags += $(shell llvm-config --libs)
 toy:toy.o
 	$(CC) toy.o -o toy $(ldflags)
 
-toy.o:toy.cpp
+toy.o:toy.cpp KaleidoscopeJIT.h
 	$(CC) -c toy.cpp $(cxxflags)
 
 .PHONY:clean

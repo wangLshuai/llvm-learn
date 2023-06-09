@@ -1,6 +1,6 @@
 #include <cctype>
 #include <cstdio>
-#include <llvm-10/llvm/Transforms/Scalar.h>
+#include <llvm-10/llvm/Support/TargetSelect.h>
 #include <map>
 #include <memory>
 #include <string>
@@ -11,20 +11,56 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/TargetSelect.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 
-using namespace llvm;
+#include "KaleidoscopeJIT.h"
 
+using namespace llvm;
+using namespace llvm::orc;
+
+class PrototypeAST;
+static void InitializeModuleAndPassManager();
 static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::unique_ptr<Module> TheModule;
 static std::map<std::string, Value *> NamedValues;
 static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+
+// PrototypeAST - This class represents the "prototype" for a function,
+// which captures its name, and its argument names (thus implicitly the number
+// of arguments the function takes).
+class PrototypeAST {
+  std::string Name;
+
+public:
+  std::vector<std::string> Args;
+  PrototypeAST(const std::string &Name, std::vector<std::string> Args)
+      : Name(Name), Args(std::move(Args)) {}
+  const std::string &getName() const { return Name; }
+  Function *codegen();
+};
 
 Value *LogErrorV(const char *Str);
+
+Function *getFunction(std::string Name) {
+  if (auto *F = TheModule->getFunction(Name))
+    return F;
+
+  // if not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI->second->codegen();
+
+  // If no existing progotype exists, return null
+  return nullptr;
+}
 
 enum Token {
   tok_eof = -1,
@@ -178,7 +214,7 @@ public:
 
 Value *CallExprAST::codegen() {
   // Look up the name in the global module table.
-  Function *CalleeF = TheModule->getFunction(Callee);
+  Function *CalleeF = getFunction(Callee);
   if (!CalleeF)
     return LogErrorV("Unknown function referenced");
 
@@ -195,20 +231,6 @@ Value *CallExprAST::codegen() {
 
   return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
 }
-
-// PrototypeAST - This class represents the "prototype" for a function,
-// which captures its name, and its argument names (thus implicitly the number
-// of arguments the function takes).
-class PrototypeAST {
-  std::string Name;
-
-public:
-  std::vector<std::string> Args;
-  PrototypeAST(const std::string &Name, std::vector<std::string> Args)
-      : Name(Name), Args(std::move(Args)) {}
-  const std::string &getName() const { return Name; }
-  Function *codegen();
-};
 
 Function *PrototypeAST::codegen() {
   // Make the function type: double(double,double) etc.
@@ -229,8 +251,6 @@ Function *PrototypeAST::codegen() {
   return F;
 }
 
-static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
-
 // FunctionAST - This class represents a function definititon itself.
 class FunctionAST {
   std::unique_ptr<PrototypeAST> Proto;
@@ -247,16 +267,12 @@ public:
 Function *FunctionAST::codegen() {
   // First, check for an existing funtion from a previoous 'extern'
   // declaration.
-  Function *TheFunction = TheModule->getFunction(Proto->getName());
-
-  if (!TheFunction)
-    TheFunction = Proto->codegen();
+  auto &P = *Proto;
+  FunctionProtos[Proto->getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
 
   if (!TheFunction)
     return nullptr;
-
-  if (!TheFunction->empty())
-    return (Function *)LogErrorV("Function cannot be redefined.");
 
   // Create a new basic block to start insertion into.
   BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
@@ -268,7 +284,7 @@ Function *FunctionAST::codegen() {
   // Set names for all arguments.
   unsigned Idx = 0;
   for (auto &Arg : TheFunction->args()) {
-    Arg.setName(Proto->Args[Idx++]);
+    Arg.setName(P.Args[Idx++]);
     NamedValues[std::string(Arg.getName())] = &Arg;
   }
 
@@ -509,6 +525,9 @@ static void HandleDefinition() {
     if (auto *FnIR = FnAST->codegen()) {
       fprintf(stderr, "Read function definition:");
       FnIR->print(errs());
+      TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
+      //  FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
     }
   } else {
     getNextToken();
@@ -519,6 +538,8 @@ static void HandleExtern() {
     if (auto *IR = ProtoAST->codegen()) {
       fprintf(stderr, "Read ProtoType:");
       IR->print(errs());
+      fprintf(stderr,"\n");
+      FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
     }
   } else {
     getNextToken();
@@ -529,9 +550,23 @@ static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
     if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read top-lev expression:");
-      FnIR->print(errs());
-      fprintf(stderr, "\n");
+      // JIT the module containing the anonymous expression, keeping a handle so
+      // we can free it later.
+      auto H = TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
+
+      // Search the JIT for the __anon_expr_symbol.
+      auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
+      assert(ExprSymbol && "Function not found");
+
+      // Get the symbol's address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() =
+          (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      // Delete the anonymous expression module from the JIT.
+      TheJIT->removeModule(H);
     }
   } else {
     getNextToken();
@@ -565,6 +600,7 @@ static void InitializeModuleAndPassManager() {
   // Open a new context and moudle.
   TheContext = std::make_unique<LLVMContext>();
   TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 
   // Create a new pass manager attached to it.
   TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
@@ -584,6 +620,10 @@ static void InitializeModuleAndPassManager() {
   Builder = std::make_unique<IRBuilder<>>(*TheContext);
 }
 int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+  TheJIT = std::make_unique<KaleidoscopeJIT>();
   InitializeModuleAndPassManager();
 
   // Install standard binary operators.
