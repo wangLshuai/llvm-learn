@@ -208,7 +208,8 @@ Value *BinaryExprAST::codegen() {
   case '*':
     return Builder->CreateFMul(L, R, "multmp");
   case '<':
-    return Builder->CreateFCmpULT(L, R, "cmptmp");
+    L = Builder->CreateFCmpULT(L, R, "cmptmp");
+    return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext), "booltmp");
   default:
     return LogErrorV("invalid binay operator");
   }
