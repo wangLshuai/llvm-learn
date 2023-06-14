@@ -732,6 +732,20 @@ static void InitializeModuleAndPassManager() {
   // Create a new builder for the module.
   Builder = std::make_unique<IRBuilder<>>(*TheContext);
 }
+
+// ========-----------------------------------------=================//
+// "Library" functions that can be "extern'd from user code"
+
+extern "C" double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+
+extern "C" double printd(double X) {
+  fprintf(stderr, "%f\n", X);
+  return 0;
+}
+
 int main() {
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();

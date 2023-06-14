@@ -2,6 +2,7 @@ CC = clang++
 cxxflags = $(shell llvm-config --cxxflags) -g
 ldflags = $(shell llvm-config --ldflags)
 ldflags += $(shell llvm-config --libs)
+ldflags +=  -Wl,--export-dynamic
 
 toy:toy.o
 	$(CC) toy.o -o toy $(ldflags)

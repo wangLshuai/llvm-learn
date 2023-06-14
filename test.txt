@@ -7,3 +7,7 @@ def f2(x) (x+2)*(x+(1+1));
 f2(5);
 def f3(n) if n<3.0 then f(n) else f2(n);
 f3(2);
+extern putchard(x);
+putchard(120);
+extern printd(x);
+printd(3.0);
