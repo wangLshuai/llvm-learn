@@ -250,6 +250,29 @@ Value *BinaryExprAST::codegen() {
   return Builder->CreateCall(F, Ops, "binop");
 }
 
+// UnaryExprAST - Expression class for a unary operator.
+class UnaryExprAST : public ExprAST {
+  char Opcode;
+  std::unique_ptr<ExprAST> Operand;
+
+public:
+  UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
+      : Opcode(Opcode), Operand(std::move(Operand)) {}
+
+  Value *codegen() override;
+};
+
+Value *UnaryExprAST::codegen() {
+  Value *OperandV = Operand->codegen();
+  if (!OperandV)
+    return nullptr;
+
+  Function *F = getFunction(std::string("unary") + Opcode);
+  if (!F)
+    return LogErrorV("Unknow unary operator");
+  return Builder->CreateCall(F, OperandV, "unop");
+}
+
 // IfexprAST - Expression class for if/then/else
 class IfExprAST : public ExprAST {
   std::unique_ptr<ExprAST> Cond, Then, Else;
@@ -705,9 +728,23 @@ static int GetTokPrecedence() {
     return -1;
   return TokPrec;
 }
+// unary
+// ::= primary
+// ::= '!'
+static std::unique_ptr<ExprAST> ParseUnary() {
+  // If the current token is not an operator, it must be a primary expr.
+  if (!isascii(CurTok) || CurTok == '(' || CurTok == ',')
+    return ParsePrimary();
 
+  // If this is a unary operator, read it.
+  int Opc = CurTok;
+  getNextToken();
+  if (auto Operand = ParseUnary())
+    return std::make_unique<UnaryExprAST>(Opc, std::move(Operand));
+  return nullptr;
+}
 // binoprhs
-// ::=('+' primary)*
+// ::=('+' unary)*
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                               std::unique_ptr<ExprAST> LHS) {
 
@@ -724,8 +761,8 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
     int BinOp = CurTok;
     getNextToken(); // eat binop
 
-    // Parse the primay expression after the binary operator.
-    auto RHS = ParsePrimary();
+    // Parse the Unary expression after the binary operator.
+    auto RHS = ParseUnary();
     if (!RHS)
       return nullptr;
 
@@ -747,7 +784,7 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
 // expression
 // ::= primary binoprhs
 static std::unique_ptr<ExprAST> ParseExpression() {
-  auto LHS = ParsePrimary();
+  auto LHS = ParseUnary();
   if (!LHS)
     return nullptr;
 
@@ -769,6 +806,15 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
   case tok_identifier:
     FnName = IdentifierStr;
     Kind = 0;
+    getNextToken();
+    break;
+  case tok_unary:
+    getNextToken();
+    if (!isascii(CurTok))
+      return LogErrorP("Expected unary operator");
+    FnName = "unary";
+    FnName += (char)CurTok;
+    Kind = 1;
     getNextToken();
     break;
   case tok_binary:
