@@ -16,3 +16,7 @@ def printstar(n)
         putchard(42);  #asii 42 == '*'
 
 printstar(2);
+
+def binary : (x y) 0;
+
+printd(123):printd(456):printd(789);
