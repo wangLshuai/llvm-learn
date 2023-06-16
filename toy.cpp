@@ -365,10 +365,12 @@ Value *ForExprAST::codegen() {
   Function *TheFunction = Builder->GetInsertBlock()->getParent();
   BasicBlock *PreheaderBB = Builder->GetInsertBlock();
   BasicBlock *LoopBB = BasicBlock::Create(*TheContext, "loop", TheFunction);
-  BasicBlock *BodyBB = BasicBlock::Create(*TheContext, "body", TheFunction);
-  // Create the "after loop" block and insert it.
-  BasicBlock *AfterBB =
-      BasicBlock::Create(*TheContext, "afterloop", TheFunction);
+  BasicBlock *BodyBB = BasicBlock::Create(
+      *TheContext, "body",
+      TheFunction); // Create the "after loop" block and insert it.
+  BasicBlock *AfterBB = BasicBlock::Create(
+      *TheContext,
+      "afterloop"); // can't insert ,becase bodyBB maybe have block nesting
 
   // Insert an explicit fall through from the current block to the LoopBB.
   Builder->CreateBr(LoopBB);
@@ -413,12 +415,15 @@ Value *ForExprAST::codegen() {
   if (!Body->codegen())
     return nullptr;
 
+  auto EndBB = Builder->GetInsertBlock();
+
   Value *NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
   // Add a new entry to the PHI node for the backedge.
-  Variable->addIncoming(NextVar, BodyBB);
+  Variable->addIncoming(NextVar, EndBB);
 
   Builder->CreateBr(LoopBB);
 
+  TheFunction->getBasicBlockList().push_back(AfterBB);
   // Any new code will be inserted in AfterBB.
   Builder->SetInsertPoint(AfterBB);
   // REstore the unshadowed variable.
