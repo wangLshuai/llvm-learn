@@ -17,7 +17,7 @@ def printstar(n)
 
 printstar(2);
 
-def binary : (x y) 0;
+def binary : 1 (x y) y;
 
 printd(123):printd(456):printd(789);
 
@@ -102,4 +102,26 @@ mandel(-2.3, -1.3, 0.05, 0.07);
  mandel(-2, -1, 0.02, 0.04);
 
  mandel(-0.9, -1.4, 0.02, 0.03);
- 
+
+
+
+# Recursive fib, we could do this before.
+def fib(x)
+    if (x < 3) then
+        1
+    else
+        fib(x-1) + fib(x-2);
+
+fib(10);
+
+printstar(100);
+
+# Iterative fib.
+def fibi(x)
+    var a = 1,b=1,c in
+    (for i = 3,i<x in
+     c = a+b:
+     a = b:
+     b = c) : b;
+
+fibi(11);
