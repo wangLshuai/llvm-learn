@@ -14,7 +14,8 @@ toy.o:toy.cpp KaleidoscopeJIT.h
 
 .PHONY:test
 test:
-	./toy < test.txt
+	./toy < fib.ks |& clang -x ir -
+	# gdb a.out
 
 clean:
 	rm *.o toy
